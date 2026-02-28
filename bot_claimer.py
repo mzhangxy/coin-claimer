@@ -90,7 +90,6 @@ async def main():
         print("[错误] 未找到 AUTH_TOKEN 环境变量，脚本终止。")
         return
 
-    # 代理依然保持清空直连测试
     proxy_list = get_proxy_list()
 
     async with async_playwright() as p:
@@ -174,14 +173,29 @@ async def main():
                             agent_config = solver.AgentConfig(GEMINI_API_KEY=GEMINI_API_KEY)
                             challenger = solver.AgentV(agent_config=agent_config, page=page)
                             
-                            if hasattr(challenger, 'execute'):
-                                print("[动作] 尝试执行 AI 识别与自动拖拽...")
-                                await challenger.execute()
-                                # 等待 AI 模型看图并完成鼠标拖拽
+                            # 【核心变动】提取并打印 AgentV 的所有公共方法
+                            methods = [m for m in dir(challenger) if not m.startswith('_')]
+                            print(f"\n>>>>>> [核心情报] AgentV 暴露的可用指令有: {methods} <<<<<<\n")
+                            
+                            # 盲猜几个最可能的触发指令
+                            if hasattr(challenger, 'solve'):
+                                print("[动作] 命中 'solve' 方法，尝试执行...")
+                                await challenger.solve()
+                                print("[等待] 正在等待 AI 模型处理图片挑战 (预设 15 秒)...")
+                                await asyncio.sleep(15)
+                            elif hasattr(challenger, 'run'):
+                                print("[动作] 命中 'run' 方法，尝试执行...")
+                                await challenger.run()
+                                print("[等待] 正在等待 AI 模型处理图片挑战 (预设 15 秒)...")
+                                await asyncio.sleep(15)
+                            elif hasattr(challenger, 'challenge'):
+                                print("[动作] 命中 'challenge' 方法，尝试执行...")
+                                await challenger.challenge()
                                 print("[等待] 正在等待 AI 模型处理图片挑战 (预设 15 秒)...")
                                 await asyncio.sleep(15)
                             else:
-                                print("[警告] 模块中找不到 execute 方法。")
+                                print("[警告] 没猜中常规方法，请提取上面的 [核心情报] 并提供给我分析！")
+
                     else:
                         print("[警告] 模块中找不到兼容的 API 方法。")
                 except Exception as e:
