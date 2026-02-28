@@ -12,6 +12,8 @@ except ImportError:
 TARGET_URL = "https://bot-hosting.net/panel/earn"
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
 RAW_PROXIES = os.environ.get("PROXY_SERVER", "")
+# 新增：获取 Gemini API Key 以驱动 AI 视觉识别
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 def get_proxy_list():
     if not RAW_PROXIES:
@@ -88,6 +90,7 @@ async def main():
         print("[错误] 未找到 AUTH_TOKEN 环境变量，脚本终止。")
         return
 
+    # 代理依然保持清空直连测试
     proxy_list = get_proxy_list()
 
     async with async_playwright() as p:
@@ -151,22 +154,24 @@ async def main():
                 await safe_screenshot(page, f"debug_hcaptcha_before_loop_{i}.png")
                 
                 try:
-                    # 核心测试点：启动 AgentV 进行全自动识别挑战
                     if solver and hasattr(solver, 'AgentV') and hasattr(solver, 'AgentConfig'):
+                        if not GEMINI_API_KEY:
+                            raise ValueError("缺少 GEMINI_API_KEY，无法启动 AI 视觉模型")
+                            
                         print("[动作] 配置 AgentConfig 并实例化 AgentV 核心...")
-                        agent_config = solver.AgentConfig()
+                        # 明确传入 API Key
+                        agent_config = solver.AgentConfig(GEMINI_API_KEY=GEMINI_API_KEY)
                         challenger = solver.AgentV(agent_config=agent_config, page=page)
                         
                         print("[动作] 尝试执行自动勾选与挑战...")
                         await challenger.handle_checkbox()
                         await asyncio.sleep(4)
                         
-                        # 尝试执行识别破解
                         if hasattr(challenger, 'execute'):
                             await challenger.execute()
-                            # 预留给 AI 处理图片和操作鼠标拖拽的时间
-                            print("[等待] 正在等待 AI 模型处理挑战 (预设 10 秒)...")
-                            await asyncio.sleep(10)
+                            # 等待 AI 模型看图并拖拽
+                            print("[等待] 正在等待 AI 模型处理图片挑战 (预设 15 秒)...")
+                            await asyncio.sleep(15)
                     else:
                         raise AttributeError("模块中找不到兼容的 API 方法")
                 except Exception as e:
