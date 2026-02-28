@@ -3,16 +3,15 @@ import asyncio
 import re
 import json
 import urllib.request
-import urllib.parse
 from playwright.async_api import async_playwright
 
 TARGET_URL = "https://bot-hosting.net/panel/earn"
-# 强制清洗：去除 GitHub Secrets 可能带入的隐形换行符和空格
+# 强制清洗：去除不可见字符
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
 RAW_PROXIES = os.environ.get("PROXY_SERVER", "").strip()
 TWOCAPTCHA_API_KEY = os.environ.get("TWOCAPTCHA_API_KEY", "").strip()
 
-KNOWN_SITEKEY = "21335a07-5b97-4a79-b1e9-b197dc35017a"
+KNOWN_HCAPTCHA_SITEKEY = "21335a07-5b97-4a79-b1e9-b197dc35017a"
 
 def get_proxy_list():
     if not RAW_PROXIES:
@@ -20,56 +19,79 @@ def get_proxy_list():
     proxies = RAW_PROXIES.replace('\n', ',').split(',')
     return [p.strip() for p in proxies if p.strip()]
 
-# --- 核心修改：使用 POST 和 urlencode，彻底规避隐形字符造成的参数截断 ---
-async def solve_hcaptcha_raw(api_key, sitekey, page_url):
-    # 再次确保参数纯净
-    api_key = api_key.strip()
-    sitekey = sitekey.strip()
-    page_url = page_url.strip()
+# --- 核心革新：直接使用 2Captcha 最新的 V2 JSON API，彻底终结 ERROR_METHOD_CALL ---
+async def solve_captcha_v2(api_key, sitekey, url, captcha_type="hcaptcha"):
+    print(f"[调试] 启用 2Captcha V2 引擎 -> 类型: {captcha_type} | Sitekey: {sitekey[:10]}...")
+    create_task_url = "https://api.2captcha.com/createTask"
     
-    print(f"[调试] 组装请求参数 -> Sitekey: {sitekey[:10]}... | URL: {page_url}")
+    # 根据检测到的类型，组装不同的 V2 任务体
+    if captcha_type == "turnstile":
+        task_payload = {
+            "type": "TurnstileTaskProxyless",
+            "websiteURL": url,
+            "websiteKey": sitekey
+        }
+    else:
+        task_payload = {
+            "type": "HCaptchaTaskProxyless",
+            "websiteURL": url,
+            "websiteKey": sitekey
+        }
+        
+    payload = {
+        "clientKey": api_key,
+        "task": task_payload
+    }
     
-    submit_url = "https://2captcha.com/in.php"
-    
-    # 将参数进行标准的 URL 编码，避免一切特殊字符干扰
-    data = urllib.parse.urlencode({
-        'key': api_key,
-        'method': 'hcaptcha',
-        'sitekey': sitekey,
-        'pageurl': page_url,
-        'json': 1
-    }).encode('utf-8')
-    
-    # 步骤 1：使用 POST 提交任务
+    # 步骤 1：创建 JSON 任务
     try:
-        req = urllib.request.Request(submit_url, data=data, method='POST')
+        req = urllib.request.Request(
+            create_task_url, 
+            data=json.dumps(payload).encode('utf-8'), 
+            headers={'Content-Type': 'application/json'}
+        )
         response = await asyncio.to_thread(urllib.request.urlopen, req, timeout=15)
         res_json = json.loads(response.read().decode('utf-8'))
         
-        if res_json.get("status") != 1:
-            return None, f"云端拒收: {res_json}"
-        task_id = res_json.get("request")
+        if res_json.get("errorId") != 0:
+            return None, f"V2 创单失败: {res_json}"
+            
+        task_id = res_json.get("taskId")
+        print(f"[状态] V2 任务创建成功, 任务流水号: {task_id}")
     except Exception as e:
-        return None, f"提交网络异常: {str(e)}"
+        return None, f"V2 提交异常: {str(e)}"
         
     # 步骤 2：轮询获取结果
-    print(f"[状态] 任务提交成功，流水号 ID: {task_id}，正在耐心轮询结果...")
-    poll_url = f"https://2captcha.com/res.php?key={api_key}&action=get&id={task_id}&json=1"
-    for _ in range(24):
+    print(f"[等待] 正在云端破解，请耐心等待 (约 10-35 秒)...")
+    get_result_url = "https://api.2captcha.com/getTaskResult"
+    result_payload = {
+        "clientKey": api_key,
+        "taskId": task_id
+    }
+    
+    for _ in range(30):
         await asyncio.sleep(5)
         try:
-            req = urllib.request.Request(poll_url)
+            req = urllib.request.Request(
+                get_result_url, 
+                data=json.dumps(result_payload).encode('utf-8'), 
+                headers={'Content-Type': 'application/json'}
+            )
             response = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
             res_json = json.loads(response.read().decode('utf-8'))
             
-            if res_json.get("status") == 1:
-                return res_json.get("request"), None  # 成功返回 Token
-            elif res_json.get("request") != "CAPCHA_NOT_READY":
-                return None, f"打码失败: {res_json}"
+            if res_json.get("errorId") != 0:
+                return None, f"获取结果失败: {res_json}"
+                
+            if res_json.get("status") == "ready":
+                solution = res_json.get("solution", {})
+                # hCaptcha 返回 gRecaptchaResponse，Turnstile 返回 token
+                token = solution.get("gRecaptchaResponse") or solution.get("token")
+                return token, None
         except Exception:
-            pass  # 忽略单次网络波动，继续轮询
+            pass
             
-    return None, "轮询等待超时 (超过2分钟)"
+    return None, "V2 轮询超时 (超过 2.5 分钟)"
 
 async def get_working_proxy(p, proxy_list):
     print(f"[状态] 发现 {len(proxy_list)} 个备选代理，开始快速可用性检测...")
@@ -208,39 +230,47 @@ async def main():
             needs_captcha = await page.locator("text='Complete the captcha'").count() > 0 or await page.locator("iframe[src*='hcaptcha.com']").count() > 0
 
             if needs_captcha:
-                print("[动作] 确认页面需要处理 hCaptcha (触发原生 2Captcha API 流程)...")
+                print("[动作] 确认页面需要处理验证码 (触发 2Captcha V2 API 流程)...")
                 
                 if not TWOCAPTCHA_API_KEY:
                     print("[警告] 缺少 TWOCAPTCHA_API_KEY 环境变量，无法启动打码服务。")
                     break
                 else:
-                    sitekey = KNOWN_SITEKEY
+                    sitekey = KNOWN_HCAPTCHA_SITEKEY
+                    captcha_type = "hcaptcha"
+                    
+                    # 动态探测页面使用的是 hCaptcha 还是可能新换的 Turnstile
                     try:
                         if await page.locator("iframe[src*='hcaptcha.com']").count() > 0:
                             iframe_src = await page.locator("iframe[src*='hcaptcha.com']").first.get_attribute("src")
                             sitekey_match = re.search(r'sitekey=([^&]+)', iframe_src)
                             if sitekey_match:
                                 sitekey = sitekey_match.group(1)
+                        elif await page.locator(".cf-turnstile").count() > 0:
+                            captcha_type = "turnstile"
+                            sitekey = await page.locator(".cf-turnstile").first.get_attribute("data-sitekey")
                     except Exception:
                         pass
 
-                    print(f"[等待] 正在向 2Captcha 云端发送请求... (预计耗时 15-45 秒，请耐心等待)")
-                    
-                    token, error_msg = await solve_hcaptcha_raw(TWOCAPTCHA_API_KEY, sitekey, page.url)
+                    token, error_msg = await solve_captcha_v2(TWOCAPTCHA_API_KEY, sitekey, page.url, captcha_type)
                     
                     if token:
-                        print("[状态] 成功获取 2Captcha Token！正在执行底层 JavaScript 注入...")
+                        print("[状态] 成功获取 Token！正在执行底层 JavaScript 双重注入...")
+                        # 同时伪装 hCaptcha 和 Turnstile 的全局对象，确保 100% 覆盖
                         await page.evaluate(f'''
                             const token = "{token}";
-                            let textareas = document.querySelectorAll('[name="h-captcha-response"], [name="g-recaptcha-response"]');
+                            const inputName = "{'cf-turnstile-response' if captcha_type == 'turnstile' else 'h-captcha-response'}";
+                            
+                            let textareas = document.querySelectorAll(`[name="${{inputName}}"], [name="g-recaptcha-response"]`);
                             if (textareas.length === 0) {{
                                 let ta = document.createElement('textarea');
-                                ta.name = 'h-captcha-response';
+                                ta.name = inputName;
                                 ta.style.display = 'none';
                                 document.body.appendChild(ta);
                                 textareas = [ta];
                             }}
                             textareas.forEach(el => {{ el.value = token; el.innerHTML = token; }});
+                            
                             window.hcaptcha = {{
                                 getResponse: function() {{ return token; }},
                                 getRespKey: function() {{ return ""; }},
@@ -248,6 +278,13 @@ async def main():
                                 render: function() {{ return 0; }},
                                 reset: function() {{}}
                             }};
+                            
+                            window.turnstile = {{
+                                getResponse: function() {{ return token; }},
+                                render: function() {{ return 0; }},
+                                reset: function() {{}}
+                            }};
+                            
                             const btn = document.querySelector(".btn-success");
                             if(btn) {{ btn.removeAttribute("disabled"); btn.classList.remove("disabled"); }}
                         ''')
