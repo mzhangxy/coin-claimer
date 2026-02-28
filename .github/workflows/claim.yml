@@ -38,9 +38,11 @@ jobs:
         env:
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
           PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          # 新增：将你设置好的 API Key 注入到环境变量中
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python bot_claimer.py
 
-      - name: 上传调试截图 (仅在运行结束或失败时)
+      - name: 上传调试截图和源码 (仅在运行结束或失败时)
         if: always()
         uses: actions/upload-artifact@v4
         with:
