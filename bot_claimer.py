@@ -14,10 +14,14 @@ async def inject_token_and_login(context):
     """
     page = await context.new_page()
     print("[状态] 正在初始化登录状态...")
-    # 先访问主域名，确保 origin 正确
-    await page.goto("https://bot-hosting.net/", wait_until="commit") 
-    await page.evaluate(f"window.localStorage.setItem('token', '{AUTH_TOKEN}');")
-    print("[状态] Token 注入完成。")
+    try:
+        # 这里也加上超时捕获，放宽判定条件为 domcontentloaded
+        await page.goto("https://bot-hosting.net/", wait_until="domcontentloaded", timeout=60000) 
+        await page.evaluate(f"window.localStorage.setItem('token', '{AUTH_TOKEN}');")
+        print("[状态] Token 注入完成。")
+    except Exception as e:
+        print(f"[错误] 注入 Token 时访问主页失败: {e}")
+        await page.screenshot(path="debug_00_inject_token_error.png")
     return page
 
 async def main():
@@ -48,13 +52,20 @@ async def main():
         # 2. 注入凭证并获取页面对象
         page = await inject_token_and_login(context)
         
-        # 移除了 stealth_async，依靠 launch_args 进行基础伪装
-        
         print(f"[状态] 正在跳转至目标收集页面: {TARGET_URL}")
-        await page.goto(TARGET_URL, wait_until="networkidle")
-        
-        # 截取第一张图，确认是否成功登录并到达指定页面
-        await page.screenshot(path="debug_01_after_login.png", full_page=True)
+        try:
+            # 优化 1：将 networkidle 改为 domcontentloaded，只要基础 DOM 加载完就算成功
+            # 优化 2：将超时时间增加到 60 秒
+            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
+            # 优化 3：强制等待 5 秒，让页面的动态元素（比如 Cloudflare 的盾或 js 渲染）跑完
+            await asyncio.sleep(5)
+            await page.screenshot(path="debug_01_after_login.png", full_page=True)
+        except Exception as e:
+            print(f"[致命错误] 访问收集页面超时或失败: {e}")
+            # 优化 4：核心！即使超时报错，也要强行截图，这样 Artifacts 就能收集到“死因”截图
+            await page.screenshot(path="debug_01_timeout_error.png", full_page=True)
+            await browser.close()
+            return
 
         # 3. 初始化 hCaptcha 挑战者
         challenger = solver.new_challenger(page)
