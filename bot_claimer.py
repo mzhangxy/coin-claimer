@@ -3,17 +3,15 @@ import asyncio
 import re
 import json
 import urllib.request
-
+import urllib.parse
 from playwright.async_api import async_playwright
 
 TARGET_URL = "https://bot-hosting.net/panel/earn"
-AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
-RAW_PROXIES = os.environ.get("PROXY_SERVER", "")
+# 强制清洗：去除 GitHub Secrets 可能带入的隐形换行符和空格
+AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
+RAW_PROXIES = os.environ.get("PROXY_SERVER", "").strip()
+TWOCAPTCHA_API_KEY = os.environ.get("TWOCAPTCHA_API_KEY", "").strip()
 
-# 获取 2Captcha API Key
-TWOCAPTCHA_API_KEY = os.environ.get("TWOCAPTCHA_API_KEY", "")
-
-# 我们从上一轮日志中成功提取到的目标网站固定 Sitekey
 KNOWN_SITEKEY = "21335a07-5b97-4a79-b1e9-b197dc35017a"
 
 def get_proxy_list():
@@ -22,22 +20,40 @@ def get_proxy_list():
     proxies = RAW_PROXIES.replace('\n', ',').split(',')
     return [p.strip() for p in proxies if p.strip()]
 
-# --- 核心新增：纯原生 2Captcha API 异步调用，彻底规避库的 ERROR_METHOD_CALL ---
+# --- 核心修改：使用 POST 和 urlencode，彻底规避隐形字符造成的参数截断 ---
 async def solve_hcaptcha_raw(api_key, sitekey, page_url):
-    submit_url = f"https://2captcha.com/in.php?key={api_key}&method=hcaptcha&sitekey={sitekey}&pageurl={page_url}&json=1"
+    # 再次确保参数纯净
+    api_key = api_key.strip()
+    sitekey = sitekey.strip()
+    page_url = page_url.strip()
     
-    # 步骤 1：提交任务
+    print(f"[调试] 组装请求参数 -> Sitekey: {sitekey[:10]}... | URL: {page_url}")
+    
+    submit_url = "https://2captcha.com/in.php"
+    
+    # 将参数进行标准的 URL 编码，避免一切特殊字符干扰
+    data = urllib.parse.urlencode({
+        'key': api_key,
+        'method': 'hcaptcha',
+        'sitekey': sitekey,
+        'pageurl': page_url,
+        'json': 1
+    }).encode('utf-8')
+    
+    # 步骤 1：使用 POST 提交任务
     try:
-        req = urllib.request.Request(submit_url)
+        req = urllib.request.Request(submit_url, data=data, method='POST')
         response = await asyncio.to_thread(urllib.request.urlopen, req, timeout=15)
         res_json = json.loads(response.read().decode('utf-8'))
+        
         if res_json.get("status") != 1:
             return None, f"云端拒收: {res_json}"
         task_id = res_json.get("request")
     except Exception as e:
         return None, f"提交网络异常: {str(e)}"
         
-    # 步骤 2：轮询获取结果 (最多等待约 2 分钟)
+    # 步骤 2：轮询获取结果
+    print(f"[状态] 任务提交成功，流水号 ID: {task_id}，正在耐心轮询结果...")
     poll_url = f"https://2captcha.com/res.php?key={api_key}&action=get&id={task_id}&json=1"
     for _ in range(24):
         await asyncio.sleep(5)
@@ -53,7 +69,7 @@ async def solve_hcaptcha_raw(api_key, sitekey, page_url):
         except Exception:
             pass  # 忽略单次网络波动，继续轮询
             
-    return None, "轮询等待超时"
+    return None, "轮询等待超时 (超过2分钟)"
 
 async def get_working_proxy(p, proxy_list):
     print(f"[状态] 发现 {len(proxy_list)} 个备选代理，开始快速可用性检测...")
@@ -166,25 +182,21 @@ async def main():
             return
             
         i = 1
-        # 【修改逻辑 1】：无限循环，直到触发完成条件或遇到失败
         while True:
             print(f"\n--- [流程] 开始第 {i} 次收集循环 ---")
             await asyncio.sleep(4)
             
-            # 关闭可能遮挡视线的广告弹窗
             try:
                 close_ad_btn = page.locator("button:has-text('X'), .close").first
                 await close_ad_btn.click(timeout=3000)
             except Exception:
                 pass
 
-            # --- 【修改逻辑 2】：以绿色按钮文字作为唯一的完美判定标准 ---
             print("[动作] 正在检查绿色按钮状态与进度...")
             try:
                 claim_btn_locator = page.locator(".btn-success").first
                 if await claim_btn_locator.count() > 0:
                     btn_text = await claim_btn_locator.inner_text()
-                    # 只要按钮文本包含 cooldown（忽略大小写），就判定为今日收集完毕
                     if "cooldown" in btn_text.lower() or "cool down" in btn_text.lower():
                         print(f"🎉 [成功] 绿色按钮显示为 '{btn_text}'！")
                         print("[结束] 检测到冷却提示，当日收集配额已满，脚本将正常退出。")
@@ -193,7 +205,6 @@ async def main():
             except Exception:
                 pass
 
-            # 判断是否需要打码
             needs_captcha = await page.locator("text='Complete the captcha'").count() > 0 or await page.locator("iframe[src*='hcaptcha.com']").count() > 0
 
             if needs_captcha:
@@ -215,7 +226,6 @@ async def main():
 
                     print(f"[等待] 正在向 2Captcha 云端发送请求... (预计耗时 15-45 秒，请耐心等待)")
                     
-                    # 调用我们手写的原生 API
                     token, error_msg = await solve_hcaptcha_raw(TWOCAPTCHA_API_KEY, sitekey, page.url)
                     
                     if token:
@@ -246,7 +256,7 @@ async def main():
                     else:
                         print(f"[错误] 2Captcha 识别失败: {error_msg}")
                         print("🛑 [中止] 本次打码无法通过，按设定停止运行并退出脚本。")
-                        break  # 【修改逻辑 3】：失败即刻退出
+                        break
             else:
                 print("[状态] 未发现需要验证码的迹象，尝试直接推进。")
 
@@ -259,7 +269,7 @@ async def main():
                 print(f"[错误] 无法定位或点击绿色按钮: {e}")
                 print("🛑 [中止] 点击流程异常，按设定停止运行并退出脚本。")
                 await safe_screenshot(page, f"debug_claim_error_loop_{i}.png")
-                break  # 【修改逻辑 3】：失败即刻退出
+                break
 
             print("[等待] 正在等待进度条 (预设 20 秒)...")
             await asyncio.sleep(20)
@@ -268,12 +278,12 @@ async def main():
                 ok_button = page.locator("button:has-text('OK')").first
                 await ok_button.click(timeout=5000)
                 print(f"[成功] 第 {i} 次金币收集闭环完成！准备进入下一轮。")
-                i += 1  # 成功后序号加 1
+                i += 1 
             except Exception as e:
                 print(f"[警告] 未检测到 Success 的 OK 按钮: {e}")
                 print("🛑 [中止] 收集流程未能成功闭环 (可能被拦截或未成功提交)，按设定停止运行并退出脚本。")
                 await safe_screenshot(page, f"debug_missing_ok_loop_{i}.png")
-                break  # 【修改逻辑 3】：失败即刻退出
+                break
 
             await asyncio.sleep(3)
 
