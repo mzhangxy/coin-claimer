@@ -15,7 +15,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip' # 缓存 pip 依赖，加速安装
+          # 这里移除了 cache: 'pip'，解决找不到 requirements.txt 的报错
 
       - name: 恢复 hCaptcha 模型缓存
         id: cache-models
