@@ -14,14 +14,12 @@ AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
 RAW_PROXIES = os.environ.get("PROXY_SERVER", "")
 
 def get_proxy_list():
-    """解析环境变量中的代理列表"""
     if not RAW_PROXIES:
         return []
     proxies = RAW_PROXIES.replace('\n', ',').split(',')
     return [p.strip() for p in proxies if p.strip()]
 
 async def get_working_proxy(p, proxy_list):
-    """测试并返回第一个可用的代理"""
     print(f"[状态] 发现 {len(proxy_list)} 个备选代理，开始快速可用性检测...")
     for proxy in proxy_list:
         print(f"[检测] 正在测试代理: {proxy}")
@@ -50,25 +48,19 @@ async def get_working_proxy(p, proxy_list):
     return None
 
 async def safe_screenshot(page, path):
-    """
-    安全截图助手：移除了 full_page=True 避免页面高度计算导致卡死，限制时间 5 秒
-    """
     try:
         await page.screenshot(path=path, timeout=5000)
     except Exception as e:
         print(f"[警告] 截图保存超时或失败 ({path})，跳过截图。")
 
 async def safe_dump_html(page, path):
-    """
-    终极调试武器：直接保存当前页面的 HTML 结构，不会受视觉渲染卡顿影响
-    """
     try:
         html_content = await page.content()
         with open(path, "w", encoding="utf-8") as f:
             f.write(html_content)
         print(f"[状态] 已成功保存当前页面 HTML 到 {path}")
     except Exception as e:
-        print(f"[警告] 保存 HTML 失败: {e}")
+        pass
 
 async def inject_token_and_login(context):
     page = await context.new_page()
@@ -132,7 +124,7 @@ async def main():
         print(f"[状态] 正在跳转至目标收集页面: {TARGET_URL}")
         try:
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(8) # 稍微延长首次加载后的等待时间，给代理更多的缓冲
+            await asyncio.sleep(8) 
         except Exception as e:
             print(f"[致命错误] 访问收集页面超时: {e}")
             await safe_screenshot(page, "debug_01_timeout_error.png")
@@ -151,7 +143,6 @@ async def main():
                 await safe_screenshot(page, f"debug_cooldown_loop_{i}.png")
                 break
 
-            # 稍微多等一会儿，防止 hCaptcha 渲染慢
             await asyncio.sleep(4)
             hcaptcha_iframe = await page.locator("iframe[src*='hcaptcha.com']").count()
 
@@ -160,13 +151,22 @@ async def main():
                 await safe_screenshot(page, f"debug_hcaptcha_before_loop_{i}.png")
                 
                 try:
-                    if solver and hasattr(solver, 'AgentV'):
-                        print("[动作] 尝试使用 AgentV 模型自动勾选...")
-                        challenger = solver.AgentV(page=page)
+                    # 核心测试点：启动 AgentV 进行全自动识别挑战
+                    if solver and hasattr(solver, 'AgentV') and hasattr(solver, 'AgentConfig'):
+                        print("[动作] 配置 AgentConfig 并实例化 AgentV 核心...")
+                        agent_config = solver.AgentConfig()
+                        challenger = solver.AgentV(agent_config=agent_config, page=page)
+                        
+                        print("[动作] 尝试执行自动勾选与挑战...")
                         await challenger.handle_checkbox()
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(4)
+                        
+                        # 尝试执行识别破解
                         if hasattr(challenger, 'execute'):
                             await challenger.execute()
+                            # 预留给 AI 处理图片和操作鼠标拖拽的时间
+                            print("[等待] 正在等待 AI 模型处理挑战 (预设 10 秒)...")
+                            await asyncio.sleep(10)
                     else:
                         raise AttributeError("模块中找不到兼容的 API 方法")
                 except Exception as e:
@@ -190,14 +190,10 @@ async def main():
                 
                 is_disabled = await claim_button.is_disabled()
                 if is_disabled:
-                    # 抓取按钮上显示的具体文字
                     btn_text = await claim_button.inner_text()
                     print(f"[拦截] 绿色按钮处于不可点击状态！按钮显示文字为: '{btn_text}'")
                     await safe_screenshot(page, f"debug_button_disabled_loop_{i}.png")
-                    
-                    # 核心新增：导出此时网页的完整 DOM 结构
                     await safe_dump_html(page, f"debug_page_source_loop_{i}.html")
-                    
                     print("[状态] 正在保留现场并中止当前流程。")
                     break
                 else:
