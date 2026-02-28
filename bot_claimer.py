@@ -11,7 +11,47 @@ except ImportError:
 # 从 GitHub Secrets 获取环境变量
 TARGET_URL = "https://bot-hosting.net/panel/earn"
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
-PROXY_SERVER = os.environ.get("PROXY_SERVER", "")
+# 现在的代理变量支持用逗号或换行符分隔的多个代理
+RAW_PROXIES = os.environ.get("PROXY_SERVER", "")
+
+def get_proxy_list():
+    """解析环境变量中的代理列表"""
+    if not RAW_PROXIES:
+        return []
+    # 支持换行或逗号分隔
+    proxies = RAW_PROXIES.replace('\n', ',').split(',')
+    return [p.strip() for p in proxies if p.strip()]
+
+async def get_working_proxy(p, proxy_list):
+    """测试并返回第一个可用的代理"""
+    print(f"[状态] 发现 {len(proxy_list)} 个备选代理，开始快速可用性检测...")
+    for proxy in proxy_list:
+        print(f"[检测] 正在测试代理: {proxy}")
+        try:
+            # 启动一个临时的无头浏览器进行测试
+            browser = await p.chromium.launch(headless=True, proxy={"server": proxy})
+            context = await browser.new_context()
+            page = await context.new_page()
+            
+            # 使用较短的超时时间 (15秒) 并且只等待 commit (收到响应头)，极大加快检测速度
+            response = await page.goto("https://bot-hosting.net/", timeout=15000, wait_until="commit")
+            
+            if response and response.status == 200:
+                print(f"[成功] 代理连通性良好: {proxy}")
+                await browser.close()
+                return proxy
+            else:
+                print(f"[警告] 代理连通，但返回状态码异常: {response.status if response else 'None'}")
+                await browser.close()
+        except Exception as e:
+            print(f"[失败] 代理超时或无法连接: {e}")
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            
+    print("[致命错误] 代理池中所有代理均检测失败！")
+    return None
 
 async def inject_token_and_login(context):
     page = await context.new_page()
@@ -40,8 +80,18 @@ async def main():
         print("[错误] 未找到 AUTH_TOKEN 环境变量，脚本终止。")
         return
 
+    proxy_list = get_proxy_list()
+
     async with async_playwright() as p:
-        # 启动配置：无头模式与底层参数防关联
+        working_proxy = None
+        # 如果配置了代理池，先找出健康的代理
+        if proxy_list:
+            working_proxy = await get_working_proxy(p, proxy_list)
+            if not working_proxy:
+                print("[中止] 没有可用代理，放弃本次任务。")
+                return
+
+        # 启动主业务配置
         launch_args = {
             "headless": True,
             "args": [
@@ -50,9 +100,12 @@ async def main():
                 "--disable-setuid-sandbox"
             ]
         }
-        if PROXY_SERVER:
-            print(f"[状态] 检测到代理配置，正在挂载代理...")
-            launch_args["proxy"] = {"server": PROXY_SERVER}
+        
+        if working_proxy:
+            print(f"[状态] 主流程将使用验证通过的代理: {working_proxy}")
+            launch_args["proxy"] = {"server": working_proxy}
+        elif not proxy_list:
+             print(f"[状态] 未配置代理，将使用直连网络运行。")
 
         browser = await p.chromium.launch(**launch_args)
         context = await browser.new_context(
@@ -125,12 +178,11 @@ async def main():
                 # 模糊匹配所有的绿色按钮
                 claim_button = page.locator("button:has-text('Click here to claim'), button:has-text('Complete the captcha'), .btn-success").first
                 
-                # 【新增检测】判断按钮是否不可点击
                 is_disabled = await claim_button.is_disabled()
                 if is_disabled:
                     print("[拦截] 绿色按钮处于不可点击状态！可能是 hCaptcha 被隐藏拦截了。")
                     await page.screenshot(path=f"debug_button_disabled_loop_{i}.png")
-                    break # 中断当前循环，保留现场截图
+                    break
                 else:
                     print("[动作] 绿色按钮可点击，尝试点击...")
                     await claim_button.click(timeout=5000)
