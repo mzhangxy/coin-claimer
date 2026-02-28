@@ -11,14 +11,12 @@ except ImportError:
 # 从 GitHub Secrets 获取环境变量
 TARGET_URL = "https://bot-hosting.net/panel/earn"
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
-# 现在的代理变量支持用逗号或换行符分隔的多个代理
 RAW_PROXIES = os.environ.get("PROXY_SERVER", "")
 
 def get_proxy_list():
     """解析环境变量中的代理列表"""
     if not RAW_PROXIES:
         return []
-    # 支持换行或逗号分隔
     proxies = RAW_PROXIES.replace('\n', ',').split(',')
     return [p.strip() for p in proxies if p.strip()]
 
@@ -28,12 +26,10 @@ async def get_working_proxy(p, proxy_list):
     for proxy in proxy_list:
         print(f"[检测] 正在测试代理: {proxy}")
         try:
-            # 启动一个临时的无头浏览器进行测试
             browser = await p.chromium.launch(headless=True, proxy={"server": proxy})
             context = await browser.new_context()
             page = await context.new_page()
             
-            # 使用较短的超时时间 (15秒) 并且只等待 commit (收到响应头)，极大加快检测速度
             response = await page.goto("https://bot-hosting.net/", timeout=15000, wait_until="commit")
             
             if response and response.status == 200:
@@ -53,20 +49,30 @@ async def get_working_proxy(p, proxy_list):
     print("[致命错误] 代理池中所有代理均检测失败！")
     return None
 
-async def safe_screenshot(page, path, full_page=False):
+async def safe_screenshot(page, path):
     """
-    安全截图助手：防止因为字体或外部图片加载过慢导致截图超时，从而搞崩整个脚本。
-    限制截图最多等待 10 秒。
+    安全截图助手：移除了 full_page=True 避免页面高度计算导致卡死，限制时间 5 秒
     """
     try:
-        await page.screenshot(path=path, full_page=full_page, timeout=10000)
+        await page.screenshot(path=path, timeout=5000)
     except Exception as e:
-        print(f"[警告] 截图保存超时或失败 ({path})，跳过截图继续执行流程。")
+        print(f"[警告] 截图保存超时或失败 ({path})，跳过截图。")
+
+async def safe_dump_html(page, path):
+    """
+    终极调试武器：直接保存当前页面的 HTML 结构，不会受视觉渲染卡顿影响
+    """
+    try:
+        html_content = await page.content()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        print(f"[状态] 已成功保存当前页面 HTML 到 {path}")
+    except Exception as e:
+        print(f"[警告] 保存 HTML 失败: {e}")
 
 async def inject_token_and_login(context):
     page = await context.new_page()
     
-    # 注入底层 Stealth 脚本，增强环境伪装
     stealth_js = """
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         window.navigator.chrome = { runtime: {} };
@@ -94,14 +100,12 @@ async def main():
 
     async with async_playwright() as p:
         working_proxy = None
-        # 如果配置了代理池，先找出健康的代理
         if proxy_list:
             working_proxy = await get_working_proxy(p, proxy_list)
             if not working_proxy:
                 print("[中止] 没有可用代理，放弃本次任务。")
                 return
 
-        # 启动主业务配置
         launch_args = {
             "headless": True,
             "args": [
@@ -128,36 +132,33 @@ async def main():
         print(f"[状态] 正在跳转至目标收集页面: {TARGET_URL}")
         try:
             await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(5)
+            await asyncio.sleep(8) # 稍微延长首次加载后的等待时间，给代理更多的缓冲
         except Exception as e:
             print(f"[致命错误] 访问收集页面超时: {e}")
-            await safe_screenshot(page, "debug_01_timeout_error.png", full_page=True)
+            await safe_screenshot(page, "debug_01_timeout_error.png")
+            await safe_dump_html(page, "debug_01_timeout_error.html")
             await browser.close()
             return
             
-        # 把正常加载后的截图移出 try-except 块，防止截图失败引发致命错误
-        await safe_screenshot(page, "debug_01_after_login.png", full_page=True)
+        await safe_screenshot(page, "debug_01_after_login.png")
 
-        # 核心收集循环 (每日 10 次上限)
         for i in range(1, 11):
             print(f"\n--- [流程] 开始第 {i}/10 次收集循环 ---")
 
-            # 步骤 A: 检查冷却状态
             cooldown_count = await page.locator("text=You are on cooldown!").count()
             if cooldown_count > 0:
                 print("[中止] 检测到处于冷却时间，今日任务可能已完成。")
-                await safe_screenshot(page, f"debug_cooldown_loop_{i}.png", full_page=True)
+                await safe_screenshot(page, f"debug_cooldown_loop_{i}.png")
                 break
 
-            # 步骤 B: 检查 hCaptcha
-            await asyncio.sleep(2)
+            # 稍微多等一会儿，防止 hCaptcha 渲染慢
+            await asyncio.sleep(4)
             hcaptcha_iframe = await page.locator("iframe[src*='hcaptcha.com']").count()
 
             if hcaptcha_iframe > 0:
                 print("[动作] 发现 hCaptcha，准备处理...")
                 await safe_screenshot(page, f"debug_hcaptcha_before_loop_{i}.png")
                 
-                # 模型容错与降级处理
                 try:
                     if solver and hasattr(solver, 'AgentV'):
                         print("[动作] 尝试使用 AgentV 模型自动勾选...")
@@ -171,7 +172,6 @@ async def main():
                 except Exception as e:
                     print(f"[警告] AI 库处理异常 ({e})。启动原生 Playwright 备用方案（强行点击复选框）...")
                     try:
-                        # 定位到验证码的 iframe 并强行点击里面的 checkbox
                         frame = page.frame_locator("iframe[src*='hcaptcha.com']").first
                         checkbox = frame.locator("#checkbox")
                         await checkbox.click()
@@ -184,16 +184,21 @@ async def main():
             else:
                 print("[状态] 未发现 hCaptcha，尝试直接推进。")
 
-            # 步骤 C: 检查并点击绿色 Claim 按钮
             print("[动作] 检查绿色按钮状态...")
             try:
-                # 模糊匹配所有的绿色按钮
                 claim_button = page.locator("button:has-text('Click here to claim'), button:has-text('Complete the captcha'), .btn-success").first
                 
                 is_disabled = await claim_button.is_disabled()
                 if is_disabled:
-                    print("[拦截] 绿色按钮处于不可点击状态！可能是 hCaptcha 被隐藏拦截了。")
+                    # 抓取按钮上显示的具体文字
+                    btn_text = await claim_button.inner_text()
+                    print(f"[拦截] 绿色按钮处于不可点击状态！按钮显示文字为: '{btn_text}'")
                     await safe_screenshot(page, f"debug_button_disabled_loop_{i}.png")
+                    
+                    # 核心新增：导出此时网页的完整 DOM 结构
+                    await safe_dump_html(page, f"debug_page_source_loop_{i}.html")
+                    
+                    print("[状态] 正在保留现场并中止当前流程。")
                     break
                 else:
                     print("[动作] 绿色按钮可点击，尝试点击...")
@@ -205,7 +210,6 @@ async def main():
                 await safe_screenshot(page, f"debug_claim_error_loop_{i}.png")
                 break
 
-            # 步骤 D: 处理可能出现的广告弹窗
             try:
                 close_ad_btn = page.locator("button:has-text('X'), .close").first
                 await close_ad_btn.click(timeout=3000)
@@ -213,12 +217,10 @@ async def main():
             except Exception:
                 pass
 
-            # 步骤 E: 等待进度条
             print("[等待] 正在等待进度条 (预设 20 秒)...")
             await asyncio.sleep(20)
             await safe_screenshot(page, f"debug_after_progressbar_loop_{i}.png")
 
-            # 步骤 F: 确认 Success 弹窗
             try:
                 ok_button = page.locator("button:has-text('OK')").first
                 await ok_button.click(timeout=5000)
