@@ -21,7 +21,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # 将依赖替换为 2captcha-python
-          pip install playwright
+          pip install --upgrade 2captcha-python playwright
           playwright install chromium --with-deps
 
       - name: 运行自动化脚本 (Run Script)
