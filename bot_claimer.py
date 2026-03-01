@@ -8,7 +8,7 @@ TARGET_URL = "https://bot-hosting.net/panel/earn"
 
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
 RAW_PROXIES = os.environ.get("PROXY_SERVER", "").strip()
-CAPTCHAKINGS_API_KEY = os.environ.get("CAPTCHAKINGS_API_KEY", "").strip()
+AZCAPTCHA_API_KEY = os.environ.get("AZCAPTCHA_API_KEY", "").strip()   # ← 新变量
 
 KNOWN_HCAPTCHA_SITEKEY = "21335a07-5b97-4a79-b1e9-b197dc35017a"
 MAX_LOOPS = 40
@@ -19,59 +19,59 @@ def get_proxy_list():
     proxies = RAW_PROXIES.replace('\n', ',').split(',')
     return [p.strip() for p in proxies if p.strip()]
 
-# ====================== CaptchaKings 打码（2026 最稳） ======================
-async def solve_hcaptcha_captchakings(page_url: str, sitekey: str, api_key: str, proxy: str = None):
-    print(f"[CaptchaKings] 提交 hCaptcha 任务 → {page_url}")
+# ====================== AZcaptcha（2026 稳定支持 hCaptcha） ======================
+async def solve_hcaptcha_azcaptcha(page_url: str, sitekey: str, api_key: str, proxy: str = None):
+    print(f"[AZcaptcha] 提交 hCaptcha 任务 → {page_url}")
     
-    create_url = "https://api.captchakings.com/createTask"
-    task = {
-        "type": "HCaptchaTaskProxyless",
-        "websiteURL": page_url,
-        "websiteKey": sitekey
+    # 提交任务
+    in_url = "https://azcaptcha.com/in.php"
+    params = {
+        "key": api_key,
+        "method": "hcaptcha",
+        "sitekey": sitekey,
+        "pageurl": page_url,
+        "json": 1
     }
     if proxy:
-        task["proxy"] = proxy
-    
-    payload = {"clientKey": api_key, "task": task}
+        params["proxy"] = proxy
+        params["proxytype"] = "HTTP"
     
     try:
-        req = urllib.request.Request(create_url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
+        req = urllib.request.Request(in_url, data=json.dumps(params).encode(), headers={'Content-Type': 'application/json'})
         resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=15)
         data = json.loads(resp.read().decode())
         
-        if data.get("errorId") != 0:
-            raise Exception(data.get("errorDescription", str(data)))
+        if data.get("status") != 1:
+            raise Exception(data.get("request", str(data)))
         
-        task_id = data["taskId"]
-        print(f"[CaptchaKings] 任务创建成功 TaskID: {task_id}")
+        task_id = data["request"]
+        print(f"[AZcaptcha] 任务创建成功 ID: {task_id}")
     except Exception as e:
-        print(f"[CaptchaKings] 创建任务失败: {e}")
+        print(f"[AZcaptcha] 提交失败: {e}")
         raise
     
-    print("[CaptchaKings] 等待解决中（通常 8-25 秒）...")
-    result_url = "https://api.captchakings.com/getTaskResult"
-    result_payload = {"clientKey": api_key, "taskId": task_id}
-    
+    # 轮询结果
+    print("[AZcaptcha] 等待解决中（通常 8-25 秒）...")
+    res_url = "https://azcaptcha.com/res.php"
     for _ in range(40):
         await asyncio.sleep(5)
         try:
-            req = urllib.request.Request(result_url, data=json.dumps(result_payload).encode(), headers={'Content-Type': 'application/json'})
+            req = urllib.request.Request(f"{res_url}?key={api_key}&action=get&id={task_id}&json=1")
             resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
             data = json.loads(resp.read().decode())
             
-            if data.get("errorId") != 0:
-                raise Exception(data.get("errorDescription"))
-            
-            if data.get("status") == "ready":
-                token = data["solution"].get("gRecaptchaResponse") or data["solution"].get("token")
-                print(f"[CaptchaKings] ✅ Token 获取成功！长度 {len(token)}")
+            if data.get("status") == 1:
+                token = data["request"]
+                print(f"[AZcaptcha] ✅ Token 获取成功！长度 {len(token)}")
                 return token
+            elif data.get("request") != "CAPCHA_NOT_READY":
+                raise Exception(data.get("request"))
         except:
             pass
     
-    raise Exception("CaptchaKings 轮询超时")
+    raise Exception("AZcaptcha 轮询超时")
 
-# ====================== 其他辅助函数 ======================
+# ====================== 其余函数（保持之前最优版本） ======================
 async def get_working_proxy(p, proxy_list):
     print(f"[Proxy] 测试 {len(proxy_list)} 个代理...")
     for proxy in proxy_list:
@@ -130,8 +130,8 @@ async def inject_token(page, token: str, is_turnstile: bool = False):
     ''')
 
 async def main():
-    if not AUTH_TOKEN or not CAPTCHAKINGS_API_KEY:
-        print("❌ 缺少 AUTH_TOKEN 或 CAPTCHAKINGS_API_KEY")
+    if not AUTH_TOKEN or not AZCAPTCHA_API_KEY:
+        print("❌ 缺少 AUTH_TOKEN 或 AZCAPTCHA_API_KEY")
         return
 
     proxy_list = get_proxy_list()
@@ -166,11 +166,9 @@ async def main():
             print(f"\n=== 第 {loop_count}/{MAX_LOOPS} 次循环 ===")
             await asyncio.sleep(3)
 
-            # 关闭弹窗
             try: await page.locator("button:has-text('X'), .close").first.click(timeout=3000)
             except: pass
 
-            # 检查冷却状态
             try:
                 btn_text = await page.locator(".btn-success").first.inner_text(timeout=5000)
                 if any(x in btn_text.lower() for x in ["cooldown", "cool down", "wait"]):
@@ -179,7 +177,6 @@ async def main():
                     break
             except: pass
 
-            # 【已修复】验证码检测 - 拆分成独立判断
             has_captcha = (
                 await page.locator("iframe[src*='hcaptcha.com']").count() > 0 or
                 await page.locator(".cf-turnstile").count() > 0 or
@@ -187,12 +184,12 @@ async def main():
             )
 
             if has_captcha:
-                print("[Captcha] 检测到验证码 → 启动 CaptchaKings")
+                print("[Captcha] 检测到验证码 → 启动 AZcaptcha")
                 try:
                     sitekey = await page.evaluate('''() => document.querySelector("[data-sitekey]")?.getAttribute("data-sitekey") || null''') or KNOWN_HCAPTCHA_SITEKEY
                     is_turnstile = await page.locator(".cf-turnstile").count() > 0
                     
-                    token = await solve_hcaptcha_captchakings(page.url, sitekey, CAPTCHAKINGS_API_KEY, working_proxy)
+                    token = await solve_hcaptcha_azcaptcha(page.url, sitekey, AZCAPTCHA_API_KEY, working_proxy)
                     await inject_token(page, token, is_turnstile)
                     await asyncio.sleep(4)
                 except Exception as e:
@@ -200,7 +197,6 @@ async def main():
                     await safe_screenshot(page, f"captcha_fail_{loop_count}.png")
                     break
 
-            # 点击 Claim
             try:
                 await page.locator(".btn-success, button:has-text('Click here to claim')").first.click(timeout=8000, force=True)
                 print("[Action] 已点击 Claim")
@@ -210,7 +206,6 @@ async def main():
                 await safe_screenshot(page, f"click_fail_{loop_count}.png")
                 break
 
-            # 等待 OK
             try:
                 await page.wait_for_selector("button:has-text('OK')", timeout=25000)
                 await page.locator("button:has-text('OK')").first.click(timeout=5000)
