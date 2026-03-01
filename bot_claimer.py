@@ -2,13 +2,14 @@ import os
 import asyncio
 import json
 import urllib.request
+import urllib.parse
 from playwright.async_api import async_playwright
 
 TARGET_URL = "https://bot-hosting.net/panel/earn"
 
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "").strip()
 RAW_PROXIES = os.environ.get("PROXY_SERVER", "").strip()
-AZCAPTCHA_API_KEY = os.environ.get("AZCAPTCHA_API_KEY", "").strip()   # ← 新变量
+AZCAPTCHA_API_KEY = os.environ.get("AZCAPTCHA_API_KEY", "").strip()
 
 KNOWN_HCAPTCHA_SITEKEY = "21335a07-5b97-4a79-b1e9-b197dc35017a"
 MAX_LOOPS = 40
@@ -19,32 +20,39 @@ def get_proxy_list():
     proxies = RAW_PROXIES.replace('\n', ',').split(',')
     return [p.strip() for p in proxies if p.strip()]
 
-# ====================== AZcaptcha（2026 稳定支持 hCaptcha） ======================
+# ====================== AZcaptcha 修复版（正确 form-urlencoded） ======================
 async def solve_hcaptcha_azcaptcha(page_url: str, sitekey: str, api_key: str, proxy: str = None):
     print(f"[AZcaptcha] 提交 hCaptcha 任务 → {page_url}")
     
-    # 提交任务
     in_url = "https://azcaptcha.com/in.php"
     params = {
         "key": api_key,
         "method": "hcaptcha",
         "sitekey": sitekey,
         "pageurl": page_url,
-        "json": 1
+        "json": "1"
     }
     if proxy:
         params["proxy"] = proxy
         params["proxytype"] = "HTTP"
     
     try:
-        req = urllib.request.Request(in_url, data=json.dumps(params).encode(), headers={'Content-Type': 'application/json'})
+        data = urllib.parse.urlencode(params).encode('utf-8')
+        req = urllib.request.Request(
+            in_url,
+            data=data,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+        )
         resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=15)
-        data = json.loads(resp.read().decode())
+        response_text = resp.read().decode('utf-8').strip()
+        print(f"[AZcaptcha] Raw submit response: {response_text[:300]}")
         
-        if data.get("status") != 1:
-            raise Exception(data.get("request", str(data)))
+        res_json = json.loads(response_text)
         
-        task_id = data["request"]
+        if res_json.get("status") != 1:
+            raise Exception(res_json.get("request", response_text))
+        
+        task_id = res_json["request"]
         print(f"[AZcaptcha] 任务创建成功 ID: {task_id}")
     except Exception as e:
         print(f"[AZcaptcha] 提交失败: {e}")
@@ -53,25 +61,35 @@ async def solve_hcaptcha_azcaptcha(page_url: str, sitekey: str, api_key: str, pr
     # 轮询结果
     print("[AZcaptcha] 等待解决中（通常 8-25 秒）...")
     res_url = "https://azcaptcha.com/res.php"
+    
     for _ in range(40):
         await asyncio.sleep(5)
         try:
-            req = urllib.request.Request(f"{res_url}?key={api_key}&action=get&id={task_id}&json=1")
+            query = urllib.parse.urlencode({
+                "key": api_key,
+                "action": "get",
+                "id": task_id,
+                "json": "1"
+            })
+            req = urllib.request.Request(f"{res_url}?{query}")
             resp = await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
-            data = json.loads(resp.read().decode())
+            response_text = resp.read().decode('utf-8').strip()
             
-            if data.get("status") == 1:
-                token = data["request"]
+            res_json = json.loads(response_text)
+            
+            if res_json.get("status") == 1:
+                token = res_json["request"]
                 print(f"[AZcaptcha] ✅ Token 获取成功！长度 {len(token)}")
                 return token
-            elif data.get("request") != "CAPCHA_NOT_READY":
-                raise Exception(data.get("request"))
-        except:
+            elif res_json.get("request") != "CAPCHA_NOT_READY":
+                raise Exception(res_json.get("request", response_text))
+        except Exception as e:
+            print(f"[AZcaptcha] 轮询异常: {e}")
             pass
     
     raise Exception("AZcaptcha 轮询超时")
 
-# ====================== 其余函数（保持之前最优版本） ======================
+# ====================== 其余函数保持不变 ======================
 async def get_working_proxy(p, proxy_list):
     print(f"[Proxy] 测试 {len(proxy_list)} 个代理...")
     for proxy in proxy_list:
